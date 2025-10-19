@@ -2,7 +2,29 @@
 # LinuxUtils.psm1
 # A PowerShell module to emulate common GNU/Linux utilities in Windows
 # Author: Ryan + ChatGPT
-# ==========================
+# ==========================\
+
+# --------------------------
+# Helper: Measure-LinuxUtil
+# --------------------------
+function Measure-LinuxUtil {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [ScriptBlock]$Script,
+        [string]$Label = "Execution"
+    )
+
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    try {
+        & $Script
+    }
+    finally {
+        $sw.Stop()
+        $elapsed = "{0:N2}" -f $sw.Elapsed.TotalSeconds
+        Write-Host "$Label completed in $elapsed seconds" -ForegroundColor Cyan
+    }
+}
 
 # --------------------------
 # wc
@@ -246,7 +268,7 @@ function df {
         [string[]]$Args
     )
 
-    # Parse flags
+    # ---------------- Flag parsing ----------------
     $opts = @{
         Human        = $false
         Human1024    = $false
@@ -266,7 +288,6 @@ function df {
             '^(-l|--local)$'              { $opts.LocalOnly = $true }
             '^(--type|-t)=(.+)$'          { $opts.TypeFilter  += $matches[2].Split(',') }
             '^(--exclude-type|-x)=(.+)$'  { $opts.ExcludeType += $matches[2].Split(',') }
-
             '^--help$' {
 @"
 Usage: df [OPTION]... [FILE]...
@@ -282,125 +303,107 @@ Options:
       --total           show grand total
       --help            display this help and exit
       --version         output version information and exit
-"@ | Write-Host
-                return
+"@ | Write-Host; return
             }
-
-            '^--version$' {
-                Write-Host "df (LinuxUtils) PowerShell version 2.1"
-                return
-            }
+            '^--version$' { Write-Host "df (LinuxUtils) PowerShell 2.5"; return }
         }
     }
 
-    # Collect drive + filesystem info
-    $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name
-    $volInfo = @{}
-    foreach ($v in (Get-CimInstance Win32_LogicalDisk -ErrorAction SilentlyContinue)) {
-        $volInfo[$v.DeviceID] = [PSCustomObject]@{
-            FileSystem = $v.FileSystem
-            DriveType  = $v.DriveType
-        }
+    # ---------------- Base selection ----------------
+    if ($opts.Human -and $opts.Human1024) { $opts.Human = $false }
+    if ($opts.Human1024) { $base=1024; $human=$true }
+    elseif ($opts.Human) { $base=1000; $human=$true }
+    else { $base=1024; $human=$false }
+
+    # ---------------- Safe drive list ----------------
+    $drives = Get-PSDrive -PSProvider FileSystem |
+              Where-Object { $_.Used -ne $null -and $_.Free -ne $null } |
+              Sort-Object Name
+
+    # ---------------- Fast, timeout-safe filesystem query ----------------
+    $volInfo=@{}
+    foreach($d in $drives){
+        try{
+            $dev="$($d.Name):"
+            $job=Start-Job -ScriptBlock {
+                param($dev)
+                Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$dev'" -ErrorAction Stop |
+                    Select-Object DeviceID,FileSystem,DriveType
+            } -ArgumentList $dev
+            $r=Receive-Job -Job $job -Wait -Timeout 1 -ErrorAction SilentlyContinue
+            Remove-Job $job -Force | Out-Null
+            if($r){ $volInfo[$dev]=$r | Select-Object -First 1 }
+        }catch{}
     }
 
-    $base  = if ($opts.Human) { 1000 } else { 1024 }
-    $human = $opts.Human -or $opts.Human1024
-
-    # Format sizes cleanly
+    # ---------------- Helpers ----------------
     function Format-Size {
-        param([double]$bytes, [bool]$human, [int]$base)
-        if (-not $human) {
-            return ("{0,14:0}" -f [math]::Round($bytes))  # no commas
-        }
-        $suffixes = "B","K","M","G","T"
-        $i = 0
-        while ($bytes -ge $base -and $i -lt $suffixes.Length - 1) {
-            $bytes /= $base
-            $i++
-        }
-        return ("{0,8:0.0}{1}" -f $bytes, $suffixes[$i])
+        param([double]$bytes,[bool]$human,[int]$base)
+        if(-not $human){return ("{0,14:0}" -f [math]::Round($bytes))}
+        $suffixes="B","K","M","G","T"
+        $i=0
+        while($bytes -ge $base -and $i -lt $suffixes.Length-1){
+            $bytes/=$base; $i++ }
+        return ("{0,8:0.1}{1}" -f $bytes,$suffixes[$i])
     }
 
-    # Filtering
-    $drives = $drives | Where-Object {
-        $v = $volInfo["$($_.Name):"]
-        if (-not $v) { return $true }
-        $include = $true
-        if ($opts.LocalOnly -and $v.DriveType -ne 3) { $include = $false }
-        if ($opts.TypeFilter.Count  -gt 0 -and ($opts.TypeFilter  -notcontains $v.FileSystem)) { $include = $false }
-        if ($opts.ExcludeType.Count -gt 0 -and ($opts.ExcludeType -contains    $v.FileSystem)) { $include = $false }
-        return $include
+    # ---------------- Table setup ----------------
+    $rows=@()
+    foreach($d in $drives){
+        $v=$volInfo["$($d.Name):"]
+        $rows+=[pscustomobject]@{
+            Filesystem=$d.Name; Type=if($v){$v.FileSystem}else{"N/A"}; Mount=$d.Root }
     }
-
-    # Header format
-    $fmt = if ($opts.ShowType) {
-        "{0,-12} {1,-8} {2,14} {3,14} {4,14} {5,6}  {6}"
-    } else {
-        "{0,-12} {1,14} {2,14} {3,14} {4,6}  {5}"
-    }
-
-    if ($opts.ShowType) {
+    $fsWidth=[Math]::Max(12,($rows|%{$_.Filesystem.Length}|Measure-Object -Maximum).Maximum)
+    $typeWidth=if($opts.ShowType){[Math]::Max(8,($rows|%{$_.Type.Length}|Measure-Object -Maximum).Maximum)}else{0}
+    $mountWidth=[Math]::Max(10,($rows|%{$_.Mount.Length}|Measure-Object -Maximum).Maximum)
+    if($opts.ShowType){
+        $fmt="{0,-$fsWidth} {1,-$typeWidth} {2,14} {3,14} {4,14} {5,6}  {6,-$mountWidth}"
         Write-Host ($fmt -f "Filesystem","Type","Size","Used","Avail","Use%","Mounted on") -ForegroundColor Cyan
     } else {
+        $fmt="{0,-$fsWidth} {1,14} {2,14} {3,14} {4,6}  {5,-$mountWidth}"
         Write-Host ($fmt -f "Filesystem","Size","Used","Avail","Use%","Mounted on") -ForegroundColor Cyan
     }
 
-    [double]$tSize = 0; [double]$tUsed = 0; [double]$tFree = 0
-    $consoleWidth = $Host.UI.RawUI.WindowSize.Width
-    if (-not $consoleWidth -or $consoleWidth -lt 60) { $consoleWidth = 120 }
-
-    # Drive rows
-    foreach ($d in $drives) {
-        try {
-            $v = $volInfo["$($d.Name):"]
-            $fsType = if ($v) { $v.FileSystem } else { "N/A" }
-
-            $size = [double]($d.Used + $d.Free)
-            $used = [double]$d.Used
-            $free = [double]$d.Free
-            $pctVal = if ($size -gt 0) { $used / $size } else { 0 }
-            $pct = ("{0,5:P0}" -f $pctVal)
-
-            $sizeStr = Format-Size $size $human $base
-            $usedStr = Format-Size $used $human $base
-            $freeStr = Format-Size $free $human $base
-            $color = if ($pctVal -ge 0.9) { 'Red' } elseif ($pctVal -ge 0.7) { 'Yellow' } else { 'Green' }
-
-            $mount = $d.Root
-            $maxMountWidth = [Math]::Max(5, $consoleWidth - 85)
-            if ($mount.Length -gt $maxMountWidth) { $mount = $mount.Substring(0, $maxMountWidth - 3) + "..." }
-
-            if ($opts.ShowType) {
-                Write-Host ($fmt -f $d.Name, $fsType, $sizeStr, $usedStr, $freeStr, $pct, $mount) -ForegroundColor $color
+    # ---------------- Main loop ----------------
+    [double]$tSize=0;[double]$tUsed=0;[double]$tFree=0
+    foreach($d in $drives){
+        try{
+            if(-not $d.Free -and -not $d.Used){continue}
+            $v=$volInfo["$($d.Name):"]
+            $fsType=if($v){$v.FileSystem}else{"N/A"}
+            $size=[double]($d.Used+$d.Free); if($size -eq 0){continue}
+            $used=[double]$d.Used; $free=[double]$d.Free
+            $pctVal=if($size -gt 0){$used/$size}else{0}
+            $pct=("{0,5:P0}" -f $pctVal)
+            $sizeStr=Format-Size $size $human $base
+            $usedStr=Format-Size $used $human $base
+            $freeStr=Format-Size $free $human $base
+            $color=if($pctVal -ge 0.9){'Red'}elseif($pctVal -ge 0.7){'Yellow'}else{'Green'}
+            if($opts.ShowType){
+                Write-Host ($fmt -f $d.Name,$fsType,$sizeStr,$usedStr,$freeStr,$pct,$d.Root) -ForegroundColor $color
             } else {
-                Write-Host ($fmt -f $d.Name, $sizeStr, $usedStr, $freeStr, $pct, $mount) -ForegroundColor $color
+                Write-Host ($fmt -f $d.Name,$sizeStr,$usedStr,$freeStr,$pct,$d.Root) -ForegroundColor $color
             }
-
-            $tSize += $size; $tUsed += $used; $tFree += $free
-        }
-        catch {
-            Write-Host ($fmt -f $d.Name,"N/A","N/A","N/A","N/A","N/A",$d.Root) -ForegroundColor DarkGray
-        }
+            $tSize+=$size; $tUsed+=$used; $tFree+=$free
+        }catch{}
     }
 
-    # Totals
-    if ($opts.ShowTotal) {
-        $pctVal = if ($tSize -gt 0) { $tUsed / $tSize } else { 0 }
-        $pct = ("{0,5:P0}" -f $pctVal)
-        $sizeStr = Format-Size $tSize $human $base
-        $usedStr = Format-Size $tUsed $human $base
-        $freeStr = Format-Size $tFree $human $base
-        $color = if ($pctVal -ge 0.9) { 'Red' } elseif ($pctVal -ge 0.7) { 'Yellow' } else { 'Green' }
-
-        if ($opts.ShowType) {
-            Write-Host ($fmt -f "total","-", $sizeStr,$usedStr,$freeStr,$pct,"") -ForegroundColor $color
+    # ---------------- Totals ----------------
+    if($opts.ShowTotal){
+        $pctVal=if($tSize -gt 0){$tUsed/$tSize}else{0}
+        $pct=("{0,5:P0}" -f $pctVal)
+        $sizeStr=Format-Size $tSize $human $base
+        $usedStr=Format-Size $tUsed $human $base
+        $freeStr=Format-Size $tFree $human $base
+        $color=if($pctVal -ge 0.9){'Red'}elseif($pctVal -ge 0.7){'Yellow'}else{'Green'}
+        if($opts.ShowType){
+            Write-Host ($fmt -f "total","-",$sizeStr,$usedStr,$freeStr,$pct,"") -ForegroundColor $color
         } else {
             Write-Host ($fmt -f "total",$sizeStr,$usedStr,$freeStr,$pct,"") -ForegroundColor $color
         }
     }
 }
-
-
 
 # --------------------------
 # Directory stack utilities
@@ -463,4 +466,142 @@ function dirs {
         Write-Output ("{0}: {1}" -f $idx, $global:DirStack[$i])
     }
 }
+
+# --------------------------
+# tree
+# --------------------------
+function tree {
+    [CmdletBinding()]
+    param(
+        [string]$Path = ".",
+        [Parameter(ValueFromRemainingArguments = $true)]
+        [string[]]$Args
+    )
+
+    $dirOnly = $false; $showSize = $false; $maxDepth = [int]::MaxValue
+    $noColor = $false; $useAscii = $false; $showHelp = $false; $treePath = $null
+
+    # -------- argument parsing --------
+    $allArgs = @(); if ($Path -and $Path -ne '.') { $allArgs += $Path }; if ($Args) { $allArgs += $Args }
+    for ($i = 0; $i -lt $allArgs.Count; $i++) {
+        $arg = $allArgs[$i]
+        switch ($arg) {
+            '-d' { $dirOnly = $true; continue }
+            '-s' { $showSize = $true; continue }
+            '-n' { $noColor = $true; continue }
+            '--ascii' { $useAscii = $true; continue }
+            '-L' {
+                if ($i + 1 -lt $allArgs.Count -and $allArgs[$i + 1] -match '^\d+$') {
+                    $maxDepth = [int]$allArgs[$i + 1]; $i++
+                }
+                continue
+            }
+            '--help' { $showHelp = $true; continue }
+        }
+        if (-not $treePath) { $treePath = $arg }
+    }
+
+    if ($showHelp) {
+@"
+Usage: tree [options] [path]
+Options:
+  -L level     Descend only level directories deep
+  -d           List directories only
+  -s           Show file size
+  -n           Turn colorization off
+  --ascii      Use ASCII tree characters
+  --help       Print this help message
+"@; return }
+
+    if (-not $treePath -or $treePath -match '^-') { $treePath = "." }
+
+    # -------- Unicode/ASCII detection --------
+    if (-not $useAscii) {
+        $enc = [Console]::OutputEncoding
+        if ($enc.WebName -notin @('utf-8','utf-16','unicode','unicodeFFFE') -or -not $env:WT_SESSION) {
+            $useAscii = $true
+        }
+    }
+
+    $script:dirCount = 0; $script:fileCount = 0
+
+    function Get-FormattedSize {
+        param([long]$bytes)
+        if ($bytes -lt 1KB) { return "$bytes`tB" }
+        elseif ($bytes -lt 1MB) { return "$([math]::Round($bytes/1KB,1))K" }
+        elseif ($bytes -lt 1GB) { return "$([math]::Round($bytes/1MB,1))M" }
+        else { return "$([math]::Round($bytes/1GB,1))G" }
+    }
+
+    function Write-TreeItem {
+        param(
+            [string]$name,[string]$prefix,[bool]$isLast,[bool]$isDir,[long]$size=0
+        )
+        $tee = if ($useAscii) { if ($isLast) { '+-- ' } else { '|-- ' } }
+               else { if ($isLast) { '??? ' } else { '??? ' } }
+        $displayName = $name
+        if ($showSize -and -not $isDir) {
+            $sizeStr = Get-FormattedSize $size
+            $displayName = "{0}`t[{1}]" -f $name, $sizeStr
+        }
+        if (-not $noColor) {
+            if ($isDir) { Write-Host -NoNewline ($prefix + $tee); Write-Host $displayName -ForegroundColor Blue }
+            else { Write-Host ($prefix + $tee + $displayName) }
+        } else {
+            Write-Host ($prefix + $tee + $displayName)
+        }
+    }
+
+    function Show-Tree {
+        param([string]$dir,[string]$prefix="",[int]$depth=0)
+        if ($depth -ge $maxDepth) { return }
+
+        $items = @()
+        try {
+            # Filter directories only if -d is active
+            if ($dirOnly) {
+                $items = Get-ChildItem -Directory -Path $dir -ErrorAction SilentlyContinue | Sort-Object Name
+            } else {
+                $items = Get-ChildItem -Path $dir -ErrorAction SilentlyContinue | Sort-Object Name
+            }
+        } catch {}
+
+        if (-not $items -or $items.Count -eq 0) { return }
+
+        $itemCount = $items.Count; $i = 0
+        foreach ($item in $items) {
+            $i++; $isLast = ($i -eq $itemCount)
+
+            # Prefix generation
+            if ($useAscii) {
+                if ($isLast) { $newPrefix = "$prefix    " }
+                else         { $newPrefix = "$prefix|   " }
+            } else {
+                if ($isLast) { $newPrefix = "$prefix    " }
+                else         { $newPrefix = "$prefix?   " }
+            }
+
+            if ($item.PSIsContainer) {
+                $script:dirCount++
+                Write-TreeItem -name $item.Name -prefix $prefix -isLast $isLast -isDir $true
+                Show-Tree -dir $item.FullName -prefix $newPrefix -depth ($depth + 1)
+            } elseif (-not $dirOnly) {
+                $script:fileCount++
+                Write-TreeItem -name $item.Name -prefix $prefix -isLast $isLast -isDir $false -size $item.Length
+            }
+        }
+    }
+
+    $root = Resolve-Path $treePath -ErrorAction SilentlyContinue
+    if (-not $root) { Write-Error "tree: cannot access '$treePath': No such file or directory"; return }
+
+    Write-Host $root.Path
+    Show-Tree -dir $root.Path
+
+    $summary = @()
+    $summary += "$script:dirCount director$(if ($script:dirCount -ne 1){'ies'}else{'y'})"
+    if (-not $dirOnly) { $summary += "$script:fileCount file$(if ($script:fileCount -ne 1){'s'}else{''})" }
+    Write-Host "`n$($summary -join ', ')"
+}
+
 # End of LinuxUtils.psm1

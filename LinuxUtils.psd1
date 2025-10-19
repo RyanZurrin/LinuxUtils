@@ -28,6 +28,7 @@
 
     # Functions to export from this module
     FunctionsToExport = @(
+        'Measure-LinuxUtil',
         'wc',
         'ls',
         'touch',
