@@ -1,0 +1,359 @@
+# LinuxUtils.psm1
+# A PowerShell module to emulate common GNU/Linux utilities in Windows
+# Author: Ryan + ChatGPT
+
+# ==========================
+# wc
+# ==========================
+function wc {
+    param (
+        [string[]]$args
+    )
+
+    # Show help if requested
+    if ($args -contains '-h' -or $args -contains '--help') {
+        @"
+Usage: wc [OPTION]... [FILE]...
+Print newline, word, and byte counts for each FILE, and a total line if
+more than one FILE is specified. With no FILE, or when FILE is -, read
+standard input.
+
+Options:
+  -c            print the byte counts
+  -m            print the character counts
+  -l            print the newline counts
+  -w            print the word counts
+  -h, --help    display this help and exit
+"@
+        return
+    }
+
+    # Default flags
+    $showLines = $false
+    $showWords = $false
+    $showChars = $false
+    $showBytes = $false
+
+    $files = @()
+    foreach ($arg in $args) {
+        switch ($arg) {
+            '-l' { $showLines = $true }
+            '-w' { $showWords = $true }
+            '-m' { $showChars = $true }
+            '-c' { $showBytes = $true }
+            default { $files += $arg }
+        }
+    }
+
+    # If no flags, default to lines, words, bytes (like GNU wc)
+    if (-not ($showLines -or $showWords -or $showChars -or $showBytes)) {
+        $showLines = $true
+        $showWords = $true
+        $showBytes = $true
+    }
+
+    function Process-Text($text, $path) {
+        $lineCount = ($text | Measure-Object -Line).Lines
+        $wordCount = ($text -split '\s+' | Where-Object { $_ -ne '' }).Count
+        $charCount = ($text | Out-String).Length
+        $byteCount = [System.Text.Encoding]::UTF8.GetByteCount(($text | Out-String))
+
+        $output = @()
+        if ($showLines) { $output += $lineCount }
+        if ($showWords) { $output += $wordCount }
+        if ($showChars) { $output += $charCount }
+        if ($showBytes) { $output += $byteCount }
+        if ($path) { $output += $path }
+
+        # Right-align counts like real wc
+        ($output | ForEach-Object { "{0,8}" -f $_ }) -join " "
+    }
+
+    $results = @()
+    $totals = @{
+        Lines = 0; Words = 0; Chars = 0; Bytes = 0
+    }
+
+    if ($files.Count -gt 0) {
+        foreach ($file in $files) {
+            if (Test-Path $file) {
+                $text = Get-Content $file
+                $results += Process-Text $text $file
+
+                if ($showLines) { $totals.Lines += ($text | Measure-Object -Line).Lines }
+                if ($showWords) { $totals.Words += (($text -split '\s+' | Where-Object { $_ -ne '' }).Count) }
+                if ($showChars) { $totals.Chars += (($text | Out-String).Length) }
+                if ($showBytes) { $totals.Bytes += ([System.Text.Encoding]::UTF8.GetByteCount(($text | Out-String))) }
+            }
+            else {
+                Write-Error ("wc: {0}: No such file" -f $file)
+            }
+        }
+
+        $results | ForEach-Object { $_ }
+        if ($files.Count -gt 1) {
+            $output = @()
+            if ($showLines) { $output += $totals.Lines }
+            if ($showWords) { $output += $totals.Words }
+            if ($showChars) { $output += $totals.Chars }
+            if ($showBytes) { $output += $totals.Bytes }
+            $output += "total"
+            ($output | ForEach-Object { "{0,8}" -f $_ }) -join " "
+        }
+    }
+    else {
+        # Read from pipeline (stdin)
+        $text = @()
+        if ($input) { $text = $input }
+        Process-Text $text $null
+    }
+}
+
+
+function ls {
+    param(
+        [string]$Path = ".",
+        [Parameter(ValueFromRemainingArguments = $true)]
+        [string[]]$Args
+    )
+
+    # Run lsd with --long and pass any other args the user provides
+    lsd --long @Args $Path
+}
+
+# ==========================
+# touch
+# ==========================
+function touch {
+    param([string[]]$Files)
+    foreach ($file in $Files) {
+        if (Test-Path $file) {
+            (Get-Item $file).LastWriteTime = Get-Date
+        } else {
+            New-Item -ItemType File -Path $file | Out-Null
+        }
+    }
+}
+
+# ==========================
+# grep
+# ==========================
+function grep {
+    param(
+        [string]$Pattern,
+        [string[]]$Files,
+        [switch]$i,
+        [switch]$v,
+        [int]$A = 0,
+        [int]$B = 0,
+        [int]$C = 0
+    )
+
+    $options = if ($i) { 'IgnoreCase' } else { 'None' }
+    $contextBefore = if ($C -gt 0) { $C } else { $B }
+    $contextAfter  = if ($C -gt 0) { $C } else { $A }
+
+    function Match-Line($lines, $index) {
+        $start = [Math]::Max(0, $index - $contextBefore)
+        $end   = [Math]::Min($lines.Count - 1, $index + $contextAfter)
+        for ($i = $start; $i -le $end; $i++) {
+            if ($i -eq $index) {
+                Write-Output $lines[$i]
+            } else {
+                Write-Output ("-" + $lines[$i])
+            }
+        }
+    }
+
+    if ($Files) {
+        foreach ($file in $Files) {
+            if (-not (Test-Path $file)) {
+                Write-Error "grep: ${file}: No such file"
+                continue
+            }
+            $lines = Get-Content $file
+            for ($i = 0; $i -lt $lines.Count; $i++) {
+                $match = $lines[$i] -match $Pattern
+                if ($i) { $match = $lines[$i] -imatch $Pattern }
+                if ($v) { $match = -not $match }
+                if ($match) { Match-Line $lines $i }
+            }
+        }
+    } else {
+        $lines = @()
+        while ($line = [Console]::In.ReadLine()) {
+            $lines += $line
+        }
+        for ($i = 0; $i -lt $lines.Count; $i++) {
+            $match = $lines[$i] -match $Pattern
+            if ($i) { $match = $lines[$i] -imatch $Pattern }
+            if ($v) { $match = -not $match }
+            if ($match) { Match-Line $lines $i }
+        }
+    }
+}
+
+# ==========================
+# head
+# ==========================
+function head {
+    param([string]$File, [int]$n = 10)
+    if (-not (Test-Path $File)) {
+        Write-Error "head: cannot open '$File'"
+        return
+    }
+    Get-Content $File | Select-Object -First $n
+}
+
+# ==========================
+# tail
+# ==========================
+function tail {
+    param([string]$File, [int]$n = 10)
+    if (-not (Test-Path $File)) {
+        Write-Error "tail: cannot open '$File'"
+        return
+    }
+    Get-Content $File -Tail $n
+}
+
+
+# ==========================
+# rm
+# ==========================
+function rm {
+    param([string[]]$Files, [switch]$r, [switch]$f)
+    foreach ($file in $Files) {
+        if (-not (Test-Path $file)) {
+            if (-not $f) { Write-Error "rm: cannot remove '$file': No such file" }
+            continue
+        }
+        Remove-Item $file -Recurse:$r -Force:$f
+    }
+}
+
+# ==========================
+# which
+# ==========================
+function which {
+    param([string]$Command)
+    $cmd = Get-Command $Command -ErrorAction SilentlyContinue
+    if ($cmd) { $cmd.Source } else { Write-Error "which: $Command not found" }
+}
+
+# ----------------------
+# tree
+# ----------------------
+function tree {
+    param(
+        [string]$Path = ".",
+        [switch]$d,          # directories only
+        [switch]$f,          # show files
+        [int]$L = [int]::MaxValue  # max depth
+    )
+
+    function Show-Tree {
+        param(
+            [string]$CurrentPath,
+            [int]$Depth = 0,
+            [string]$Prefix = ""
+        )
+        if ($Depth -ge $L) { return }
+
+        $items = Get-ChildItem -LiteralPath $CurrentPath
+        if ($d) { $items = $items | Where-Object { $_.PSIsContainer } }
+
+        for ($i = 0; $i -lt $items.Count; $i++) {
+            $item = $items[$i]
+            $isLast = ($i -eq $items.Count - 1)
+            $connector = if ($isLast) { "`u2514`u2500`u2500" } else { "`u251C`u2500`u2500" }
+
+            Write-Host "$Prefix$connector $($item.Name)"
+
+            if ($item.PSIsContainer -and ($f -or $d)) {
+                $newPrefix = $Prefix + (if ($isLast) { "    " } else { "`u2502   " })
+                Show-Tree -CurrentPath $item.FullName -Depth ($Depth + 1) -Prefix $newPrefix
+            }
+        }
+    }
+
+    Show-Tree -CurrentPath $Path
+}
+
+# ----------------------
+# Directory history stack (Bash-style)
+# ----------------------
+# Initialize global directory stack if not already present
+if (-not (Test-Path Variable:\DirStack)) {
+    $global:DirStack = @()
+}
+
+# Remove the built-in cd alias so our function is used
+if (Get-Alias cd -ErrorAction SilentlyContinue) {
+    Remove-Item Alias:cd
+}
+
+# Override cd with duplicate prevention
+function cd {
+    param([string]$Path)
+
+    $current = (Get-Location).Path
+
+    if (-not $Path) {
+        Set-Location $HOME
+    } elseif (Test-Path $Path) {
+        $resolvedPath = (Resolve-Path $Path).Path
+
+        # Only push if different from current location
+        if ($current -ne $resolvedPath) {
+            $global:DirStack += $current
+        }
+
+        Set-Location $resolvedPath
+    } else {
+        Write-Error ("cd: {0}: No such file or directory" -f $Path)
+    }
+}
+
+
+
+# Go back to a previous directory in the stack by index (Bash/Oh-My-Bash style)
+function go {
+    param([int]$Index = 1)
+
+    if ($global:DirStack.Count -eq 0) {
+        Write-Error "Directory stack is empty"
+        return
+    }
+
+    if ($Index -lt 1 -or $Index -gt $global:DirStack.Count) {
+        Write-Error ("Index out of range (1 to {0})" -f $global:DirStack.Count)
+        return
+    }
+
+    # Bash-style: 1 = last directory
+    $Target = $global:DirStack[-$Index]
+    $current = (Get-Location).Path
+
+    # Move to target directory
+    Set-Location $Target
+
+    # Push current location onto stack before removing target
+    $global:DirStack += $current
+
+    # Remove the target directory from the stack
+    $global:DirStack = $global:DirStack[0..($global:DirStack.Count - $Index - 1)]
+}
+
+# Show directory stack with Bash-style numbering
+function dirs {
+    if ($global:DirStack.Count -eq 0) {
+        Write-Output "Directory stack is empty"
+        return
+    }
+
+    for ($i = 0; $i -lt $global:DirStack.Count; $i++) {
+        $idx = $global:DirStack.Count - $i
+        Write-Output ("{0}: {1}" -f $idx, $global:DirStack[$i])
+    }
+}
