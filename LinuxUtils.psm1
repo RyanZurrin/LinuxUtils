@@ -248,13 +248,13 @@ function df {
 
     # Parse flags
     $opts = @{
-        Human        = $false  # -H / --si (base 1000)
-        Human1024    = $false  # -h / --human-readable (base 1024)
-        ShowType     = $false  # -T / --print-type
-        ShowTotal    = $false  # --total
-        LocalOnly    = $false  # -l / --local
-        TypeFilter   = @()     # -t=NTFS,FAT32
-        ExcludeType  = @()     # -x=FAT32
+        Human        = $false
+        Human1024    = $false
+        ShowType     = $false
+        ShowTotal    = $false
+        LocalOnly    = $false
+        TypeFilter   = @()
+        ExcludeType  = @()
     }
 
     foreach ($arg in $Args) {
@@ -266,7 +266,8 @@ function df {
             '^(-l|--local)$'              { $opts.LocalOnly = $true }
             '^(--type|-t)=(.+)$'          { $opts.TypeFilter  += $matches[2].Split(',') }
             '^(--exclude-type|-x)=(.+)$'  { $opts.ExcludeType += $matches[2].Split(',') }
-'^--help$' {
+
+            '^--help$' {
 @"
 Usage: df [OPTION]... [FILE]...
 Display file system disk space usage.
@@ -282,14 +283,15 @@ Options:
       --help            display this help and exit
       --version         output version information and exit
 "@ | Write-Host
-    return
-}
-'^--version$' {
-    Write-Host "df (LinuxUtils) PowerShell version 2.0 — Phase 2A"
-    return
-}
-        }  # end switch
-    }      # end foreach
+                return
+            }
+
+            '^--version$' {
+                Write-Host "df (LinuxUtils) PowerShell version 2.1"
+                return
+            }
+        }
+    }
 
     # Collect drive + filesystem info
     $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name
@@ -304,110 +306,101 @@ Options:
     $base  = if ($opts.Human) { 1000 } else { 1024 }
     $human = $opts.Human -or $opts.Human1024
 
-    # Size formatting (no thousands separators; PS5-safe)
+    # Format sizes cleanly
     function Format-Size {
         param([double]$bytes, [bool]$human, [int]$base)
-
         if (-not $human) {
-            $txt = "{0:0}" -f [math]::Round($bytes)
-            return $txt.PadLeft(14)
+            return ("{0,14:0}" -f [math]::Round($bytes))  # no commas
         }
-
-        if ($bytes -lt $base) {
-            $val = "{0:0}"   -f [double]$bytes;      return ($val + 'B').PadLeft(8)
-        } elseif ($bytes -lt [math]::Pow($base,2)) {
-            $val = "{0:0.0}" -f ([double]$bytes / $base);             return ($val + 'K').PadLeft(8)
-        } elseif ($bytes -lt [math]::Pow($base,3)) {
-            $val = "{0:0.0}" -f ([double]$bytes / [math]::Pow($base,2)); return ($val + 'M').PadLeft(8)
-        } elseif ($bytes -lt [math]::Pow($base,4)) {
-            $val = "{0:0.0}" -f ([double]$bytes / [math]::Pow($base,3)); return ($val + 'G').PadLeft(8)
-        } else {
-            $val = "{0:0.0}" -f ([double]$bytes / [math]::Pow($base,4)); return ($val + 'T').PadLeft(8)
+        $suffixes = "B","K","M","G","T"
+        $i = 0
+        while ($bytes -ge $base -and $i -lt $suffixes.Length - 1) {
+            $bytes /= $base
+            $i++
         }
+        return ("{0,8:0.0}{1}" -f $bytes, $suffixes[$i])
     }
 
     # Filtering
     $drives = $drives | Where-Object {
-        $v = $volInfo[$_.Name.TrimEnd(':')]
+        $v = $volInfo["$($_.Name):"]
         if (-not $v) { return $true }
-
         $include = $true
         if ($opts.LocalOnly -and $v.DriveType -ne 3) { $include = $false }
-        if ($opts.TypeFilter.Count   -gt 0 -and ($opts.TypeFilter  -notcontains $v.FileSystem)) { $include = $false }
-        if ($opts.ExcludeType.Count  -gt 0 -and ($opts.ExcludeType -contains    $v.FileSystem)) { $include = $false }
+        if ($opts.TypeFilter.Count  -gt 0 -and ($opts.TypeFilter  -notcontains $v.FileSystem)) { $include = $false }
+        if ($opts.ExcludeType.Count -gt 0 -and ($opts.ExcludeType -contains    $v.FileSystem)) { $include = $false }
         return $include
     }
 
-    # Header
-    if ($opts.ShowType) {
-        Write-Host ("Filesystem".PadRight(12) + "Type".PadRight(8) + "Size".PadLeft(14) + "Used".PadLeft(14) + "Avail".PadLeft(14) + "Use%".PadLeft(6) + "  Mounted on") -ForegroundColor Cyan
+    # Header format
+    $fmt = if ($opts.ShowType) {
+        "{0,-12} {1,-8} {2,14} {3,14} {4,14} {5,6}  {6}"
     } else {
-        Write-Host ("Filesystem".PadRight(12) + "Size".PadLeft(14) + "Used".PadLeft(14) + "Avail".PadLeft(14) + "Use%".PadLeft(6) + "  Mounted on") -ForegroundColor Cyan
+        "{0,-12} {1,14} {2,14} {3,14} {4,6}  {5}"
+    }
+
+    if ($opts.ShowType) {
+        Write-Host ($fmt -f "Filesystem","Type","Size","Used","Avail","Use%","Mounted on") -ForegroundColor Cyan
+    } else {
+        Write-Host ($fmt -f "Filesystem","Size","Used","Avail","Use%","Mounted on") -ForegroundColor Cyan
     }
 
     [double]$tSize = 0; [double]$tUsed = 0; [double]$tFree = 0
     $consoleWidth = $Host.UI.RawUI.WindowSize.Width
     if (-not $consoleWidth -or $consoleWidth -lt 60) { $consoleWidth = 120 }
 
-    # Rows
+    # Drive rows
     foreach ($d in $drives) {
         try {
-            $v = $volInfo[$d.Name.TrimEnd(':')]
+            $v = $volInfo["$($d.Name):"]
             $fsType = if ($v) { $v.FileSystem } else { "N/A" }
 
             $size = [double]($d.Used + $d.Free)
             $used = [double]$d.Used
             $free = [double]$d.Free
             $pctVal = if ($size -gt 0) { $used / $size } else { 0 }
+            $pct = ("{0,5:P0}" -f $pctVal)
 
-            $pct = ("{0:0}%" -f ([math]::Round($pctVal * 100, 0))).PadLeft(6)
             $sizeStr = Format-Size $size $human $base
             $usedStr = Format-Size $used $human $base
             $freeStr = Format-Size $free $human $base
-
             $color = if ($pctVal -ge 0.9) { 'Red' } elseif ($pctVal -ge 0.7) { 'Yellow' } else { 'Green' }
 
             $mount = $d.Root
             $maxMountWidth = [Math]::Max(5, $consoleWidth - 85)
             if ($mount.Length -gt $maxMountWidth) { $mount = $mount.Substring(0, $maxMountWidth - 3) + "..." }
 
-            $line = if ($opts.ShowType) {
-                $d.Name.PadRight(12) + $fsType.PadRight(8) + $sizeStr + $usedStr + $freeStr
+            if ($opts.ShowType) {
+                Write-Host ($fmt -f $d.Name, $fsType, $sizeStr, $usedStr, $freeStr, $pct, $mount) -ForegroundColor $color
             } else {
-                $d.Name.PadRight(12) + $sizeStr + $usedStr + $freeStr
+                Write-Host ($fmt -f $d.Name, $sizeStr, $usedStr, $freeStr, $pct, $mount) -ForegroundColor $color
             }
-
-            Write-Host -NoNewline $line
-            Write-Host -NoNewline $pct -ForegroundColor $color
-            Write-Host ("  " + $mount)
 
             $tSize += $size; $tUsed += $used; $tFree += $free
         }
         catch {
-            Write-Host ($d.Name.PadRight(12) + "N/A".PadLeft(14) + "N/A".PadLeft(14) + "N/A".PadLeft(14) + "N/A".PadLeft(6) + "  " + $d.Root) -ForegroundColor DarkGray
+            Write-Host ($fmt -f $d.Name,"N/A","N/A","N/A","N/A","N/A",$d.Root) -ForegroundColor DarkGray
         }
     }
 
     # Totals
     if ($opts.ShowTotal) {
         $pctVal = if ($tSize -gt 0) { $tUsed / $tSize } else { 0 }
-        $pct = ("{0:0}%" -f ([math]::Round($pctVal * 100, 0))).PadLeft(6)
+        $pct = ("{0,5:P0}" -f $pctVal)
         $sizeStr = Format-Size $tSize $human $base
         $usedStr = Format-Size $tUsed $human $base
         $freeStr = Format-Size $tFree $human $base
         $color = if ($pctVal -ge 0.9) { 'Red' } elseif ($pctVal -ge 0.7) { 'Yellow' } else { 'Green' }
 
-        $line = if ($opts.ShowType) {
-            "total".PadRight(12) + "-".PadRight(8) + $sizeStr + $usedStr + $freeStr
+        if ($opts.ShowType) {
+            Write-Host ($fmt -f "total","-", $sizeStr,$usedStr,$freeStr,$pct,"") -ForegroundColor $color
         } else {
-            "total".PadRight(12) + $sizeStr + $usedStr + $freeStr
+            Write-Host ($fmt -f "total",$sizeStr,$usedStr,$freeStr,$pct,"") -ForegroundColor $color
         }
-
-        Write-Host -NoNewline $line
-        Write-Host -NoNewline $pct -ForegroundColor $color
-        Write-Host ""
     }
 }
+
+
 
 # --------------------------
 # Directory stack utilities
@@ -440,7 +433,7 @@ function go {
     }
 
     if ($Index -lt 1 -or $Index -gt $global:DirStack.Count) {
-        Write-Error ("Index out of range 1–{0}" -f $global:DirStack.Count)
+        Write-Error ("Index out of range 1-{0}" -f $global:DirStack.Count)
         return
     }
 
@@ -454,7 +447,7 @@ function go {
     # Push current location onto stack before removing target
     $global:DirStack += $current
 
-    # Remove the target directory from the stack
+    # Remove the target directory from the stackyt-dlp 
     $global:DirStack = $global:DirStack[0..($global:DirStack.Count - $Index - 1)]
 }
 
