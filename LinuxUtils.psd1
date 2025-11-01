@@ -29,6 +29,7 @@
     # Functions to export from this module
     FunctionsToExport = @(
         'Measure-LinuxUtil',
+        'Get-DiskHealth',
         'wc',
         'ls',
         'touch',

@@ -7,22 +7,174 @@
 # --------------------------
 # Helper: Measure-LinuxUtil
 # --------------------------
-function Measure-LinuxUtil {
+function Get-DiskHealth {
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory)]
-        [ScriptBlock]$Script,
-        [string]$Label = "Execution"
+        [Parameter(ValueFromRemainingArguments = $true)]
+        [string[]]$Args
     )
 
-    $sw = [System.Diagnostics.Stopwatch]::StartNew()
-    try {
-        & $Script
+    # -------------------- Flag parsing --------------------
+    $DriveLetters = @()
+    $DebugMode = $false
+    $ShowHelp = $false
+    $ListOnly = $false
+
+    foreach ($arg in $Args) {
+        switch -regex ($arg) {
+            '^--help$'   { $ShowHelp = $true; continue }
+            '^--debug$'  { $DebugMode = $true; continue }
+            '^--list$'   { $ListOnly = $true; continue }
+            '^[A-Za-z]$' { $DriveLetters += $arg; continue }
+            default      { $DriveLetters += $arg }
+        }
     }
-    finally {
-        $sw.Stop()
-        $elapsed = "{0:N2}" -f $sw.Elapsed.TotalSeconds
-        Write-Host "$Label completed in $elapsed seconds" -ForegroundColor Cyan
+
+    if ($ShowHelp) {
+@"
+Usage: Get-DiskHealth [DriveLetter(s)] [--list] [--debug] [--help]
+
+Description:
+    Displays detailed health and SMART diagnostic information for one or more drives.
+    Automatically correlates logical volumes, partitions, and physical disks.
+
+Examples:
+    Get-DiskHealth
+        Show info for all mounted volumes.
+
+    Get-DiskHealth C,D
+        Show detailed health for drives C and D.
+
+    Get-DiskHealth G --debug
+        Include extra internal debug traces for troubleshooting.
+
+    Get-DiskHealth --list
+        Show a concise table of all detected drives and volumes.
+
+Options:
+    --list     Show all currently detected volumes and their key properties.
+    --debug    Print detailed internal operations and variable traces.
+    --help     Show this help message.
+
+Outputs:
+    Displays:
+        • Health status (Healthy, Warning, Unhealthy)
+        • Operational status (OK, Full Repair Needed, etc.)
+        • File system type and free/used space
+        • Disk model, bus, firmware version
+        • SMART metrics (if available)
+        • Recommendations for repair or replacement
+
+Notes:
+    Some drives (especially USB and exFAT) may not expose SMART data.
+    Run as Administrator for full access to SMART and hardware info.
+"@ | Write-Host
+        return
+    }
+
+    # -------------------- --list mode --------------------
+    if ($ListOnly) {
+        Write-Host "Detected Volumes and Drives" -ForegroundColor Cyan
+        Write-Host "---------------------------"
+        try {
+            $vols = Get-Volume | Where-Object { $_.DriveLetter }
+            $disks = Get-Disk
+            $mapped = @()
+
+            foreach ($v in $vols) {
+                $disk = $null
+                try {
+                    $part = Get-Partition -DriveLetter $v.DriveLetter -ErrorAction SilentlyContinue
+                    if ($part) {
+                        $disk = $disks | Where-Object { $_.Number -eq $part.DiskNumber }
+                    }
+                } catch {}
+                $mapped += [PSCustomObject]@{
+                    Drive = "$($v.DriveLetter):"
+                    Label = $v.FriendlyName
+                    FileSystem = $v.FileSystemType
+                    Health = $v.HealthStatus
+                    Type = if ($disk) { $disk.BusType } else { "Unknown" }
+                    SizeGB = [math]::Round($v.Size/1GB,1)
+                    FreeGB = [math]::Round($v.SizeRemaining/1GB,1)
+                }
+            }
+
+            $mapped | Format-Table Drive,Label,FileSystem,Type,Health,SizeGB,FreeGB
+        } catch {
+            Write-Host "Error retrieving volume information: $_" -ForegroundColor Red
+        }
+        return
+    }
+
+    # -------------------- Default behavior --------------------
+    if (-not $DriveLetters -or $DriveLetters.Count -eq 0) {
+        $DriveLetters = (Get-Volume | Where-Object DriveLetter | Select-Object -ExpandProperty DriveLetter)
+    }
+
+    function Write-DebugMsg($msg) {
+        if ($DebugMode) { Write-Host "[DEBUG] $msg" -ForegroundColor DarkGray }
+    }
+
+    foreach ($dl in $DriveLetters) {
+        Write-Host "===============================" -ForegroundColor Cyan
+        Write-Host " Drive ${dl}:" -ForegroundColor Cyan
+        Write-Host "===============================" -ForegroundColor Cyan
+
+        try {
+            $vol = Get-Volume -DriveLetter $dl -ErrorAction Stop
+            $part = Get-Partition -DriveLetter $dl -ErrorAction SilentlyContinue
+            $disk = if ($part) { Get-Disk -Number $part.DiskNumber -ErrorAction SilentlyContinue }
+            $phys = if ($disk) { Get-PhysicalDisk | Where-Object { $_.FriendlyName -eq $disk.FriendlyName } }
+
+            Write-DebugMsg "Volume: $($vol.FriendlyName) | FileSystem=$($vol.FileSystemType) | Size=$([math]::Round($vol.Size/1GB,1)) GB"
+            Write-DebugMsg "Partition=$($part.PartitionNumber) Disk=$($disk.Number) Physical=$($phys.FriendlyName)"
+
+            Write-Host "Health Status     : $($vol.HealthStatus)"
+            Write-Host "Operational Status: $($vol.OperationalStatus)"
+            Write-Host "File System       : $($vol.FileSystemType)"
+            Write-Host "Size / Free       : $([math]::Round($vol.Size/1GB,1)) GB / $([math]::Round($vol.SizeRemaining/1GB,1)) GB"
+            Write-Host "Drive Type        : $($vol.DriveType)"
+            Write-Host ""
+
+            if ($disk) {
+                Write-Host "Disk Model        : $($disk.FriendlyName)"
+                Write-Host "Media Type        : $($disk.MediaType)"
+                Write-Host "Bus Type          : $($disk.BusType)"
+                Write-Host "Health Status     : $($disk.HealthStatus)"
+                Write-Host "Operational Status: $($disk.OperationalStatus)"
+                Write-Host "Firmware Version  : $($disk.FirmwareVersion)"
+                Write-Host ""
+            }
+
+            try {
+                $smart = Get-StorageReliabilityCounter -PhysicalDisk $phys -ErrorAction Stop
+                Write-Host "SMART Data:"
+                Write-Host ("  Power-On Hours   : {0}" -f $smart.PowerOnHours)
+                Write-Host ("  Temperature (°C) : {0}" -f $smart.Temperature)
+                Write-Host ("  Wear Percentage  : {0}" -f $smart.Wear)
+                Write-Host ("  Read Errors      : {0}" -f $smart.ReadErrorsTotal)
+                Write-Host ("  Write Errors     : {0}" -f $smart.WriteErrorsTotal)
+                Write-Host ("  Realloc Sectors  : {0}" -f $smart.ReallocatedSectors)
+            } catch {
+                Write-Host "SMART Data         : Not available (not all drives expose it)" -ForegroundColor DarkGray
+            }
+
+            Write-Host ""
+            if ($vol.HealthStatus -ne "Healthy" -or ($disk -and $disk.HealthStatus -ne "Healthy")) {
+                Write-Host "?  Recommendation:" -ForegroundColor Yellow
+                if ($vol.OperationalStatus -match "Repair") {
+                    Write-Host "   Run 'chkdsk ${dl}: /f' and back up your data." -ForegroundColor Yellow
+                } elseif ($disk -and $disk.HealthStatus -eq "Warning") {
+                    Write-Host "   Check SMART data and consider replacing the drive." -ForegroundColor Yellow
+                } else {
+                    Write-Host "   Inspect event logs or use vendor diagnostic tools." -ForegroundColor Yellow
+                }
+                Write-Host ""
+            }
+        } catch {
+            Write-Host "Error retrieving info for ${dl}: $_" -ForegroundColor Red
+        }
     }
 }
 
@@ -270,14 +422,15 @@ function df {
 
     # ---------------- Flag parsing ----------------
     $opts = @{
-        Human        = $false
-        Human1024    = $false
+        Human        = $false     # --si  (base 1000)
+        Human1024    = $false     # -h    (base 1024)
         ShowType     = $false
         ShowTotal    = $false
         LocalOnly    = $false
         TypeFilter   = @()
         ExcludeType  = @()
         Strict       = $false
+        Debug        = $false
     }
 
     foreach ($arg in $Args) {
@@ -290,32 +443,33 @@ function df {
             '^(--type|-t)=(.+)$'           { $opts.TypeFilter  += $matches[2].Split(',') }
             '^(--exclude-type|-x)=(.+)$'   { $opts.ExcludeType += $matches[2].Split(',') }
             '^--strict$'                   { $opts.Strict = $true }
+            '^--debug$'                    { $opts.Debug  = $true }
             '^--help$' {
 @"
 Usage: df [OPTION]... [FILE]...
 Display file system disk space usage.
 
 Options:
-  --si                 use powers of 1000 (e.g., 1.1G)
-  -h, --human-readable use powers of 1024 (e.g., 1.1Gi)
-  -T, --print-type     show filesystem type
-  -t, --type=TYPE      show only file systems of type TYPE
-  -x, --exclude-type=T exclude file systems of type TYPE
-  -l, --local          limit listing to local file systems
-      --total          show grand total
-      --strict         use high-precision volume data (slower)
-      --help           display this help and exit
-      --version        output version information and exit
+  -h, --human-readable  show sizes in powers of 1024 (e.g. 1.1G)
+      --si              show sizes in powers of 1000 (e.g. 1.1G)
+  -T, --print-type      show filesystem type
+  -t, --type=TYPE       show only file systems of type TYPE
+  -x, --exclude-type=T  exclude file systems of type TYPE
+  -l, --local           limit listing to local file systems
+      --total           show grand total
+      --strict          include health/encryption info (slower)
+      --debug           verbose internal info for troubleshooting
+      --help            display this help and exit
+      --version         output version information and exit
 
 Note:
-    PowerShell automatically converts all flags to lowercase, so '-H' cannot be used.
-    Use '--si' instead to select base-1000 human-readable units.
-    
+  PowerShell lowercases short flags, so '-H' can't be distinguished.
+  Use '--si' to force base-1000 output (same as GNU df -H).
 "@ | Write-Host
                 return
             }
             '^--version$' {
-                Write-Host "df (LinuxUtils) PowerShell version 2.8"
+                Write-Host "df (LinuxUtils) PowerShell version 3.2-debug"
                 return
             }
         }
@@ -324,19 +478,36 @@ Note:
     # ---------------- Base selection ----------------
     if ($opts.Human -and $opts.Human1024) { $opts.Human = $false }
 
-    if ($opts.Human1024) { $base = 1024; $human = $true }
-    elseif ($opts.Human) { $base = 1000; $human = $true }
-    else { $base = 1024; $human = $false }
+    if ($opts.Human1024) {
+        $base  = 1024
+        $human = $true
+        $modeDesc = "binary (1024)"
+    }
+    elseif ($opts.Human) {
+        $base  = 1000
+        $human = $true
+        $modeDesc = "decimal (1000)"
+    }
+    else {
+        $base  = 1024
+        $human = $false
+        $modeDesc = "raw bytes"
+    }
 
-    # ---------------- Drive collection ----------------
+    if ($opts.Debug) {
+        Write-Host "[DEBUG] human=$human base=$base mode=$modeDesc" -ForegroundColor Yellow
+    }
+
+    # ---------------- Collect drives ----------------
     $drives = Get-PSDrive -PSProvider FileSystem |
               Where-Object { $_.Used -ne $null -and $_.Free -ne $null } |
               Sort-Object Name
 
-    # ---------------- Filesystem info ----------------
+    # ---------------- Core volume info ----------------
     $volInfo = @{}
     try {
-        $cims = Get-CimInstance Win32_LogicalDisk -ErrorAction Stop | Where-Object { $_.Size -ne $null }
+        $cims = Get-CimInstance Win32_LogicalDisk -ErrorAction Stop |
+                Where-Object { $_.Size -ne $null }
         foreach ($v in $cims) {
             $volInfo[$v.DeviceID.ToUpper()] = [PSCustomObject]@{
                 FileSystem = $v.FileSystem
@@ -348,12 +519,11 @@ Note:
             }
         }
     } catch {
-        Write-Warning "Warning: Unable to query logical disks. Some drive types may be missing."
+        Write-Warning "Warning: Unable to query logical disks. Some drive info may be missing."
     }
 
-    # ---------------- Strict mode ----------------
+    # ---------------- Strict mode extras ----------------
     if ($opts.Strict) {
-        Write-Host "Strict mode: Gathering detailed volume info..." -ForegroundColor Yellow
         try {
             $vols = Get-CimInstance Win32_Volume -ErrorAction Stop |
                     Where-Object { $_.DriveLetter -ne $null -and $_.Capacity -ne $null }
@@ -369,121 +539,178 @@ Note:
                 }
             }
 
-            # BitLocker + Health
-            $volState = Get-Volume -ErrorAction SilentlyContinue | Where-Object { $_.DriveLetter }
-            foreach ($v in $volState) {
-                $key = ($v.DriveLetter + ":").ToUpper()
-                if ($volInfo.ContainsKey($key)) {
-                    $volInfo[$key].Health = $v.HealthStatus
-                    if ($v.BitLockerProtection -match 'On|Enabled|Encrypted') {
-                        $volInfo[$key].Encrypted = 'Yes'
+            $volState = Get-Volume -ErrorAction SilentlyContinue |
+                        Where-Object { $_.DriveLetter }
+            foreach ($vs in $volState) {
+                $key2 = ($vs.DriveLetter + ":").ToUpper()
+                if ($volInfo.ContainsKey($key2)) {
+                    $volInfo[$key2].Health = $vs.HealthStatus
+                    if ($vs.BitLockerProtection -match 'On|Enabled|Encrypted') {
+                        $volInfo[$key2].Encrypted = 'Yes'
                     } else {
-                        $volInfo[$key].Encrypted = 'No'
+                        $volInfo[$key2].Encrypted = 'No'
                     }
                 }
             }
-
-            Write-Host "Strict mode applied successfully." -ForegroundColor Green
         } catch {
-            Write-Warning "Strict mode failed or incomplete. Falling back to standard info."
+            Write-Warning "Strict mode: extended volume info not fully available."
         }
     }
 
-    # ---------------- Size formatter ----------------
+    # ---------------- Human size formatter ----------------
     function Format-Size {
-        param([double]$bytes, [bool]$human, [int]$base)
-        if (-not $human) { return ("{0,14:0}" -f [math]::Round($bytes)) }
-        if ($base -eq 1024) { $suffixes = "B","Ki","Mi","Gi","Ti","Pi" }
-        else { $suffixes = "B","K","M","G","T","P" }
+        param(
+            [double]$bytes,
+            [bool]$humanMode,
+            [int]$unitBase,
+            [bool]$dbg
+        )
+
+        if (-not $humanMode) {
+            $rawOut = [string][math]::Round($bytes)
+            if ($dbg) { Write-Host "[DEBUG] Format-Size raw $bytes -> $rawOut" -ForegroundColor DarkCyan }
+            return $rawOut
+        }
+
+        $suffixes = @('B','K','M','G','T','P','E','Z','Y')
         $i = 0
-        while ($bytes -ge $base -and $i -lt $suffixes.Length - 1) { $bytes /= $base; $i++ }
-        return ("{0,8:0.1}{1}" -f $bytes, $suffixes[$i])
+        $scaled = $bytes
+        while (($scaled -ge $unitBase) -and ($i -lt ($suffixes.Length - 1))) {
+            $scaled = $scaled / $unitBase
+            $i++
+        }
+
+        # string with 1 decimal
+        $valStr = ("{0:N1}" -f $scaled)  # e.g. "932.1"
+        # trim trailing .0 specifically
+        if ($valStr -match '\.0$') {
+            $valStr = $valStr -replace '\.0$', ''
+        }
+
+        $final = $valStr + $suffixes[$i]
+
+        if ($dbg) {
+            Write-Host "[DEBUG] Format-Size $bytes base=$unitBase -> $final (scaled=$scaled index=$i)" -ForegroundColor DarkCyan
+        }
+
+        return $final
     }
 
-    # ---------------- Header setup ----------------
+    # ---------------- Build rows ----------------
     $showHealth = $opts.Strict
     $rows = @()
+
     foreach ($d in $drives) {
-        $v = $volInfo["$($d.Name.ToUpper()):"]
-        $fsType = if ($v) { $v.FileSystem } else { "Unknown" }
+        $key = ($d.Name + ":").ToUpper()
+        $v = $volInfo[$key]
+
+        if (-not $v) { continue }
+
+        $sizeBytes = [double]$v.Capacity
+        $freeBytes = [double]$v.FreeSpace
+        $usedBytes = $sizeBytes - $freeBytes
+
+        if ($opts.Debug) {
+            Write-Host "[DEBUG] Drive $($d.Name): sizeBytes=$sizeBytes freeBytes=$freeBytes usedBytes=$usedBytes" -ForegroundColor Yellow
+        }
+
+        $sizeStr = Format-Size $sizeBytes $human $base $opts.Debug
+        $usedStr = Format-Size $usedBytes $human $base $opts.Debug
+        $freeStr = Format-Size $freeBytes $human $base $opts.Debug
+
+        $pctVal = if ($sizeBytes -gt 0) { $usedBytes / $sizeBytes } else { 0 }
+        $pctStr = ("{0:P0}" -f $pctVal).Trim()
+
+        $typeOut   = if ($v.FileSystem) { $v.FileSystem } else { "Unknown" }
+        $healthOut = if ($v.Health)     { $v.Health     } else { "N/A" }
+        $encOut    = if ($v.Encrypted)  { $v.Encrypted  } else { "N/A" }
+
         $rows += [PSCustomObject]@{
-            Filesystem = $d.Name
-            Type       = $fsType
-            Mount      = $d.Root
+            FS        = $d.Name
+            Type      = $typeOut
+            SizeStr   = $sizeStr
+            UsedStr   = $usedStr
+            FreeStr   = $freeStr
+            PctStr    = $pctStr
+            Mount     = $d.Root
+            Health    = $healthOut
+            Enc       = $encOut
+            RawSize   = $sizeBytes
+            RawUsed   = $usedBytes
+            RawFree   = $freeBytes
         }
     }
 
-    $fsWidth   = [Math]::Max(12, ($rows | ForEach-Object { $_.Filesystem.Length } | Measure-Object -Maximum).Maximum)
-    $typeWidth = if ($opts.ShowType) { [Math]::Max(8, ($rows | ForEach-Object { $_.Type.Length } | Measure-Object -Maximum).Maximum) } else { 0 }
-    $mountWidth = [Math]::Max(10, ($rows | ForEach-Object { $_.Mount.Length } | Measure-Object -Maximum).Maximum)
-
-    if ($opts.ShowType -and $showHealth) {
-        $fmt = "{0,-$fsWidth} {1,-$typeWidth} {2,14} {3,14} {4,14} {5,6} {6,10} {7,8}  {8,-$mountWidth}"
-        Write-Host ($fmt -f "Filesystem","Type","Size","Used","Avail","Use%","Health","Encrypted","Mounted on") -ForegroundColor Cyan
-    } elseif ($opts.ShowType) {
-        $fmt = "{0,-$fsWidth} {1,-$typeWidth} {2,14} {3,14} {4,14} {5,6}  {6,-$mountWidth}"
-        Write-Host ($fmt -f "Filesystem","Type","Size","Used","Avail","Use%","Mounted on") -ForegroundColor Cyan
-    } else {
-        $fmt = "{0,-$fsWidth} {1,14} {2,14} {3,14} {4,6}  {5,-$mountWidth}"
-        Write-Host ($fmt -f "Filesystem","Size","Used","Avail","Use%","Mounted on") -ForegroundColor Cyan
-    }
-
-    # ---------------- Main loop ----------------
-    [double]$tSize = 0; [double]$tUsed = 0; [double]$tFree = 0
-    foreach ($d in $drives) {
-        try {
-            $v = $volInfo["$($d.Name.ToUpper()):"]
-            if (-not $v) { continue }
-
-            $size = [double]$v.Capacity
-            $free = [double]$v.FreeSpace
-            $used = $size - $free
-            if ($size -eq 0) { continue }
-
-            $pctVal = if ($size -gt 0) { $used / $size } else { 0 }
-            $pct = ("{0,5:P0}" -f $pctVal)
-            $sizeStr = Format-Size $size $human $base
-            $usedStr = Format-Size $used $human $base
-            $freeStr = Format-Size $free $human $base
-            $color = if ($pctVal -ge 0.9) { 'Red' } elseif ($pctVal -ge 0.7) { 'Yellow' } else { 'Green' }
-
-            $healthVal = if ($null -ne $v.Health) { $v.Health } else { "N/A" }
-            $encVal = if ($null -ne $v.Encrypted) { $v.Encrypted } else { "N/A" }
-
-            if ($opts.ShowType -and $showHealth) {
-                Write-Host ($fmt -f $d.Name, $v.FileSystem, $sizeStr, $usedStr, $freeStr, $pct, $healthVal, $encVal, $d.Root) -ForegroundColor $color
-            } elseif ($opts.ShowType) {
-                Write-Host ($fmt -f $d.Name, $v.FileSystem, $sizeStr, $usedStr, $freeStr, $pct, $d.Root) -ForegroundColor $color
-            } else {
-                Write-Host ($fmt -f $d.Name, $sizeStr, $usedStr, $freeStr, $pct, $d.Root) -ForegroundColor $color
-            }
-
-            $tSize += $size; $tUsed += $used; $tFree += $free
-        } catch {
-            Write-Host ($fmt -f $d.Name,"N/A","N/A","N/A","N/A","N/A",$d.Root) -ForegroundColor DarkGray
-        }
-    }
-
-    # ---------------- Totals ----------------
+    # ---------------- Totals row (if --total) ----------------
     if ($opts.ShowTotal) {
-        $pctVal = if ($tSize -gt 0) { $tUsed / $tSize } else { 0 }
-        $pct = ("{0,5:P0}" -f $pctVal)
-        $sizeStr = Format-Size $tSize $human $base
-        $usedStr = Format-Size $tUsed $human $base
-        $freeStr = Format-Size $tFree $human $base
-        $color = if ($pctVal -ge 0.9) { 'Red' } elseif ($pctVal -ge 0.7) { 'Yellow' } else { 'Green' }
+        $totalSize = ($rows | Measure-Object RawSize -Sum).Sum
+        $totalUsed = ($rows | Measure-Object RawUsed -Sum).Sum
+        $totalFree = ($rows | Measure-Object RawFree -Sum).Sum
+        $totalPct  = if ($totalSize -gt 0) { $totalUsed / $totalSize } else { 0 }
+
+        $rows += [PSCustomObject]@{
+            FS        = 'total'
+            Type      = '-'
+            SizeStr   = Format-Size $totalSize $human $base $opts.Debug
+            UsedStr   = Format-Size $totalUsed $human $base $opts.Debug
+            FreeStr   = Format-Size $totalFree $human $base $opts.Debug
+            PctStr    = ("{0:P0}" -f $totalPct).Trim()
+            Mount     = ''
+            Health    = if ($showHealth) { '-' } else { "N/A" }
+            Enc       = if ($showHealth) { '-' } else { "N/A" }
+        }
+    }
+
+    # ---------------- Column widths ----------------
+    $fsWidth     = [Math]::Max(10, ($rows | ForEach-Object { $_.FS.Length }      | Measure-Object -Maximum).Maximum)
+    $typeWidth   = if ($opts.ShowType) {
+        [Math]::Max(4, ($rows | ForEach-Object { $_.Type.Length }    | Measure-Object -Maximum).Maximum)
+    } else { 0 }
+    $sizeWidth   = [Math]::Max(4, ($rows | ForEach-Object { $_.SizeStr.Length }  | Measure-Object -Maximum).Maximum)
+    $usedWidth   = [Math]::Max(4, ($rows | ForEach-Object { $_.UsedStr.Length }  | Measure-Object -Maximum).Maximum)
+    $freeWidth   = [Math]::Max(4, ($rows | ForEach-Object { $_.FreeStr.Length }  | Measure-Object -Maximum).Maximum)
+    $pctWidth    = [Math]::Max(4, ($rows | ForEach-Object { $_.PctStr.Length }   | Measure-Object -Maximum).Maximum)
+    $healthWidth = if ($showHealth) {
+        [Math]::Max(6, ($rows | ForEach-Object { $_.Health.Length }  | Measure-Object -Maximum).Maximum)
+    } else { 0 }
+    $encWidth    = if ($showHealth) {
+        [Math]::Max(3, ($rows | ForEach-Object { $_.Enc.Length }     | Measure-Object -Maximum).Maximum)
+    } else { 0 }
+    $mountWidth  = [Math]::Max(8, ($rows | ForEach-Object { $_.Mount.Length }    | Measure-Object -Maximum).Maximum)
+
+    # ---------------- Header + row format ----------------
+    if ($opts.ShowType -and $showHealth) {
+        $fmtRow = "{0,-$fsWidth} {1,-$typeWidth} {2,$sizeWidth} {3,$usedWidth} {4,$freeWidth} {5,$pctWidth} {6,-$healthWidth} {7,-$encWidth}  {8,-$mountWidth}"
+        Write-Host ($fmtRow -f "Filesystem","Type","Size","Used","Avail","Use%","Health","Enc","Mounted on") -ForegroundColor Cyan
+    }
+    elseif ($opts.ShowType) {
+        $fmtRow = "{0,-$fsWidth} {1,-$typeWidth} {2,$sizeWidth} {3,$usedWidth} {4,$freeWidth} {5,$pctWidth}  {6,-$mountWidth}"
+        Write-Host ($fmtRow -f "Filesystem","Type","Size","Used","Avail","Use%","Mounted on") -ForegroundColor Cyan
+    }
+    else {
+        $fmtRow = "{0,-$fsWidth} {1,$sizeWidth} {2,$usedWidth} {3,$freeWidth} {4,$pctWidth}  {5,-$mountWidth}"
+        Write-Host ($fmtRow -f "Filesystem","Size","Used","Avail","Use%","Mounted on") -ForegroundColor Cyan
+    }
+
+    # ---------------- Emit rows ----------------
+    foreach ($r in $rows) {
+        $pctNum = 0
+        if ($r.PctStr -match '(\d+)%') { $pctNum = [int]$matches[1] }
+        $color = if ($pctNum -ge 90) { 'Red' }
+                 elseif ($pctNum -ge 70) { 'Yellow' }
+                 else { 'Green' }
 
         if ($opts.ShowType -and $showHealth) {
-            Write-Host ($fmt -f "total","-",$sizeStr,$usedStr,$freeStr,$pct,"-","-","") -ForegroundColor $color
-        } elseif ($opts.ShowType) {
-            Write-Host ($fmt -f "total","-",$sizeStr,$usedStr,$freeStr,$pct,"") -ForegroundColor $color
-        } else {
-            Write-Host ($fmt -f "total",$sizeStr,$usedStr,$freeStr,$pct,"") -ForegroundColor $color
+            Write-Host ($fmtRow -f $r.FS,$r.Type,$r.SizeStr,$r.UsedStr,$r.FreeStr,$r.PctStr,$r.Health,$r.Enc,$r.Mount) -ForegroundColor $color
+        }
+        elseif ($opts.ShowType) {
+            Write-Host ($fmtRow -f $r.FS,$r.Type,$r.SizeStr,$r.UsedStr,$r.FreeStr,$r.PctStr,$r.Mount) -ForegroundColor $color
+        }
+        else {
+            Write-Host ($fmtRow -f $r.FS,$r.SizeStr,$r.UsedStr,$r.FreeStr,$r.PctStr,$r.Mount) -ForegroundColor $color
         }
     }
 }
-
-
 
 
 # --------------------------
