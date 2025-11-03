@@ -7,6 +7,28 @@
 # --------------------------
 # Helper: Measure-LinuxUtil
 # --------------------------
+function Measure-LinuxUtil {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [ScriptBlock]$Script,
+        [string]$Label = "Execution"
+    )
+
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    try {
+        & $Script
+    }
+    finally {
+        $sw.Stop()
+        $elapsed = "{0:N2}" -f $sw.Elapsed.TotalSeconds
+        Write-Host "$Label completed in $elapsed seconds" -ForegroundColor Cyan
+    }
+}
+
+# --------------------------
+# Helper: Get-DiskHealth
+# --------------------------
 function Get-DiskHealth {
     [CmdletBinding()]
     param(
@@ -14,169 +36,236 @@ function Get-DiskHealth {
         [string[]]$Args
     )
 
-    # -------------------- Flag parsing --------------------
-    $DriveLetters = @()
-    $DebugMode = $false
+    # -------------------- Parse args --------------------
+    $Targets  = @()
     $ShowHelp = $false
     $ListOnly = $false
+    $Debug    = $false
+    $All      = $false
 
     foreach ($arg in $Args) {
         switch -regex ($arg) {
-            '^--help$'   { $ShowHelp = $true; continue }
-            '^--debug$'  { $DebugMode = $true; continue }
-            '^--list$'   { $ListOnly = $true; continue }
-            '^[A-Za-z]$' { $DriveLetters += $arg; continue }
-            default      { $DriveLetters += $arg }
+            '^--help$'  { $ShowHelp = $true; continue }
+            '^--debug$' { $Debug    = $true; continue }
+            '^--list$'  { $ListOnly = $true; continue }
+            '^--all$'   { $All      = $true; continue }
+            '^disk:(\d+)$' { $Targets += $arg; continue }
+            '^[A-Za-z]:?$' { $Targets += ($arg.TrimEnd(':').ToUpper()); continue }
+            default { $Targets += $arg }
         }
     }
 
     if ($ShowHelp) {
 @"
-Usage: Get-DiskHealth [DriveLetter(s)] [--list] [--debug] [--help]
+Usage: Get-DiskHealth [targets...] [--all] [--list] [--debug] [--help]
 
-Description:
-    Displays detailed health and SMART diagnostic information for one or more drives.
-    Automatically correlates logical volumes, partitions, and physical disks.
-
-Examples:
-    Get-DiskHealth
-        Show info for all mounted volumes.
-
-    Get-DiskHealth C,D
-        Show detailed health for drives C and D.
-
-    Get-DiskHealth G --debug
-        Include extra internal debug traces for troubleshooting.
-
-    Get-DiskHealth --list
-        Show a concise table of all detected drives and volumes.
+Targets:
+  Drive letters:   C   D   E   or with colon C:
+  Disk numbers:    disk:N  (ex: disk:8)
 
 Options:
-    --list     Show all currently detected volumes and their key properties.
-    --debug    Print detailed internal operations and variable traces.
-    --help     Show this help message.
+  --all     Include every physical disk and volume, even those without letters.
+  --list    Show a concise table of both volumes and disks.
+  --debug   Print internal tracing for troubleshooting.
+  --help    Show this help message.
 
-Outputs:
-    Displays:
-        • Health status (Healthy, Warning, Unhealthy)
-        • Operational status (OK, Full Repair Needed, etc.)
-        • File system type and free/used space
-        • Disk model, bus, firmware version
-        • SMART metrics (if available)
-        • Recommendations for repair or replacement
+Examples:
+  Get-DiskHealth
+      Show info for all mounted volumes with drive letters.
 
-Notes:
-    Some drives (especially USB and exFAT) may not expose SMART data.
-    Run as Administrator for full access to SMART and hardware info.
+  Get-DiskHealth --all
+      Enumerate all disks and volumes, including No Media.
+
+  Get-DiskHealth --list
+      Print summary table.
+
+  Get-DiskHealth G disk:8
+      Show drive G and disk 8 details.
 "@ | Write-Host
         return
     }
 
-    # -------------------- --list mode --------------------
-    if ($ListOnly) {
-        Write-Host "Detected Volumes and Drives" -ForegroundColor Cyan
-        Write-Host "---------------------------"
-        try {
-            $vols = Get-Volume | Where-Object { $_.DriveLetter }
-            $disks = Get-Disk
-            $mapped = @()
+    function Write-DebugMsg([string]$msg) { if ($Debug) { Write-Host "[DEBUG] $msg" -ForegroundColor DarkGray } }
 
-            foreach ($v in $vols) {
-                $disk = $null
-                try {
-                    $part = Get-Partition -DriveLetter $v.DriveLetter -ErrorAction SilentlyContinue
-                    if ($part) {
-                        $disk = $disks | Where-Object { $_.Number -eq $part.DiskNumber }
-                    }
-                } catch {}
-                $mapped += [PSCustomObject]@{
-                    Drive = "$($v.DriveLetter):"
-                    Label = $v.FriendlyName
-                    FileSystem = $v.FileSystemType
-                    Health = $v.HealthStatus
-                    Type = if ($disk) { $disk.BusType } else { "Unknown" }
-                    SizeGB = [math]::Round($v.Size/1GB,1)
-                    FreeGB = [math]::Round($v.SizeRemaining/1GB,1)
-                }
-            }
-
-            $mapped | Format-Table Drive,Label,FileSystem,Type,Health,SizeGB,FreeGB
-        } catch {
-            Write-Host "Error retrieving volume information: $_" -ForegroundColor Red
-        }
+    # -------------------- Verify required cmdlets --------------------
+    if (-not (Get-Command Get-Disk -ErrorAction SilentlyContinue)) {
+        Write-Error "Get-DiskHealth requires the Storage module (Get-Disk, Get-Volume, etc.)."
         return
     }
 
-    # -------------------- Default behavior --------------------
-    if (-not $DriveLetters -or $DriveLetters.Count -eq 0) {
-        $DriveLetters = (Get-Volume | Where-Object DriveLetter | Select-Object -ExpandProperty DriveLetter)
+    # -------------------- Collect system info --------------------
+    try { $allDisks = Get-Disk | Sort-Object Number } catch { $allDisks = @() }
+    try { $allVols  = Get-Volume -ErrorAction SilentlyContinue } catch { $allVols = @() }
+    try { $physDisks = Get-PhysicalDisk -ErrorAction SilentlyContinue } catch { $physDisks = @() }
+
+    $psDrives = Get-PSDrive -PSProvider FileSystem | Where-Object { $_.Root -match '^[A-Za-z]:\\' }
+
+    Write-DebugMsg ("Disks: " + ($allDisks.Number -join ', '))
+    Write-DebugMsg ("Volumes: " + $allVols.Count)
+    Write-DebugMsg ("PSDrives: " + $psDrives.Count)
+
+    # -------------------- Helper functions --------------------
+    function Resolve-PhysicalDisk($disk) {
+        $pd = $physDisks | Where-Object { $_.FriendlyName -eq $disk.FriendlyName } | Select-Object -First 1
+        if (-not $pd -and $disk.SerialNumber) {
+            $pd = $physDisks | Where-Object { $_.SerialNumber -eq $disk.SerialNumber } | Select-Object -First 1
+        }
+        return $pd
     }
 
-    function Write-DebugMsg($msg) {
-        if ($DebugMode) { Write-Host "[DEBUG] $msg" -ForegroundColor DarkGray }
-    }
-
-    foreach ($dl in $DriveLetters) {
-        Write-Host "===============================" -ForegroundColor Cyan
-        Write-Host " Drive ${dl}:" -ForegroundColor Cyan
-        Write-Host "===============================" -ForegroundColor Cyan
-
-        try {
-            $vol = Get-Volume -DriveLetter $dl -ErrorAction Stop
+    function Resolve-ByDriveLetter([string]$letter) {
+        $dl = $letter.TrimEnd(':').ToUpper()
+        $vol = $allVols | Where-Object {
+            $_.DriveLetter -and ($_.DriveLetter.ToString().ToUpper() -eq $dl)
+        } | Select-Object -First 1
+        if ($vol) {
             $part = Get-Partition -DriveLetter $dl -ErrorAction SilentlyContinue
-            $disk = if ($part) { Get-Disk -Number $part.DiskNumber -ErrorAction SilentlyContinue }
-            $phys = if ($disk) { Get-PhysicalDisk | Where-Object { $_.FriendlyName -eq $disk.FriendlyName } }
+            $disk = $allDisks | Where-Object { $_.Number -eq $part.DiskNumber } | Select-Object -First 1
+            return [PSCustomObject]@{ Volume = $vol; Partition = $part; Disk = $disk }
+        }
 
-            Write-DebugMsg "Volume: $($vol.FriendlyName) | FileSystem=$($vol.FileSystemType) | Size=$([math]::Round($vol.Size/1GB,1)) GB"
-            Write-DebugMsg "Partition=$($part.PartitionNumber) Disk=$($disk.Number) Physical=$($phys.FriendlyName)"
+        # Fallback for PSDrive-only detection
+        $ps = $psDrives | Where-Object { $_.Root.StartsWith("${dl}:") }
+        if ($ps) {
+            return [PSCustomObject]@{
+                Volume = [PSCustomObject]@{
+                    DriveLetter       = $dl
+                    HealthStatus      = "Unknown"
+                    OperationalStatus = "Mounted (PSDrive)"
+                    FileSystemType    = "Unknown"
+                    Size              = $ps.Used + $ps.Free
+                    SizeRemaining     = $ps.Free
+                    DriveType         = "Unknown"
+                }
+                Partition = $null
+                Disk = $null
+            }
+        }
+        return $null
+    }
 
-            Write-Host "Health Status     : $($vol.HealthStatus)"
-            Write-Host "Operational Status: $($vol.OperationalStatus)"
-            Write-Host "File System       : $($vol.FileSystemType)"
-            Write-Host "Size / Free       : $([math]::Round($vol.Size/1GB,1)) GB / $([math]::Round($vol.SizeRemaining/1GB,1)) GB"
-            Write-Host "Drive Type        : $($vol.DriveType)"
+    function Resolve-ByDiskNumber([int]$n) {
+        $disk = $allDisks | Where-Object { $_.Number -eq $n } | Select-Object -First 1
+        if (-not $disk) { return $null }
+        $parts = Get-Partition -DiskNumber $n -ErrorAction SilentlyContinue
+        $vols = @()
+        foreach ($p in $parts) {
+            $v = $allVols | Where-Object {
+                $_.DriveLetter -and ($_.DriveLetter.ToString().ToUpper() -eq $p.DriveLetter.ToString().ToUpper())
+            }
+            if ($v) { $vols += $v }
+        }
+        [PSCustomObject]@{ Disk = $disk; Partitions = $parts; Volumes = ($vols | Select-Object -Unique) }
+    }
+
+    # -------------------- --list mode --------------------
+    if ($ListOnly) {
+        Write-Host "`nVolumes" -ForegroundColor Cyan
+        Write-Host "-------"
+        $allVols | Sort-Object DriveLetter | ForEach-Object {
+            [PSCustomObject]@{
+                Drive   = if ($_.DriveLetter) { "$($_.DriveLetter):" } else { "" }
+                Label   = $_.FriendlyName
+                FileSys = $_.FileSystemType
+                Health  = $_.HealthStatus
+                SizeGB  = [math]::Round($_.Size/1GB,1)
+                FreeGB  = [math]::Round($_.SizeRemaining/1GB,1)
+            }
+        } | Format-Table -AutoSize
+
+        Write-Host "`nDisks" -ForegroundColor Cyan
+        Write-Host "-----"
+        $allDisks | ForEach-Object {
+            [PSCustomObject]@{
+                Disk = $_.Number
+                Model = $_.FriendlyName
+                Bus = $_.BusType
+                Media = $_.MediaType
+                Health = $_.HealthStatus
+                SizeGB = [math]::Round($_.Size/1GB,1)
+            }
+        } | Format-Table -AutoSize
+        return
+    }
+
+    # -------------------- Select targets --------------------
+    $work = @()
+    if ($Targets.Count -eq 0) {
+        if ($All) {
+            foreach ($d in $allDisks) { $work += "disk:$($d.Number)" }
+        } else {
+            $letters = ($allVols | Where-Object DriveLetter | Select-Object -ExpandProperty DriveLetter -Unique)
+            if (-not $letters) { $letters = $psDrives.Root.Substring(0,1) | Sort-Object -Unique }
+            foreach ($dl in $letters) { $work += $dl.ToString().ToUpper() }
+        }
+    } else { $work = $Targets }
+
+    # -------------------- Output per target --------------------
+    foreach ($t in $work) {
+        if ($t -match '^disk:(\d+)$') {
+            $dn = [int]$matches[1]
+            $res = Resolve-ByDiskNumber $dn
+            if (-not $res) { Write-Host "Disk ${dn} not found." -ForegroundColor Red; continue }
+            $disk = $res.Disk; $pd = Resolve-PhysicalDisk $disk
+
+            Write-Host "`n===============================" -ForegroundColor Cyan
+            Write-Host " Disk ${dn} ($($disk.FriendlyName))" -ForegroundColor Cyan
+            Write-Host "===============================" -ForegroundColor Cyan
+            Write-Host "Bus Type          : $($disk.BusType)"
+            Write-Host "Health Status     : $($disk.HealthStatus)"
+            Write-Host "Size              : $([math]::Round($disk.Size/1GB,1)) GB"
             Write-Host ""
 
-            if ($disk) {
-                Write-Host "Disk Model        : $($disk.FriendlyName)"
-                Write-Host "Media Type        : $($disk.MediaType)"
-                Write-Host "Bus Type          : $($disk.BusType)"
-                Write-Host "Health Status     : $($disk.HealthStatus)"
-                Write-Host "Operational Status: $($disk.OperationalStatus)"
-                Write-Host "Firmware Version  : $($disk.FirmwareVersion)"
-                Write-Host ""
+            if ($res.Volumes) {
+                Write-Host "Volumes:" -ForegroundColor Cyan
+                foreach ($v in $res.Volumes) {
+                    Write-Host ("  {0,-4} {1,-6} {2,-8} Size={3,6}GB Free={4,6}GB" -f `
+                        "$($v.DriveLetter):", $v.FileSystemType, $v.HealthStatus, `
+                        [math]::Round($v.Size/1GB,1), [math]::Round($v.SizeRemaining/1GB,1))
+                }
+            } else {
+                Write-Host "No volumes detected." -ForegroundColor DarkGray
             }
 
             try {
-                $smart = Get-StorageReliabilityCounter -PhysicalDisk $phys -ErrorAction Stop
-                Write-Host "SMART Data:"
-                Write-Host ("  Power-On Hours   : {0}" -f $smart.PowerOnHours)
-                Write-Host ("  Temperature (°C) : {0}" -f $smart.Temperature)
-                Write-Host ("  Wear Percentage  : {0}" -f $smart.Wear)
-                Write-Host ("  Read Errors      : {0}" -f $smart.ReadErrorsTotal)
-                Write-Host ("  Write Errors     : {0}" -f $smart.WriteErrorsTotal)
-                Write-Host ("  Realloc Sectors  : {0}" -f $smart.ReallocatedSectors)
-            } catch {
-                Write-Host "SMART Data         : Not available (not all drives expose it)" -ForegroundColor DarkGray
-            }
-
-            Write-Host ""
-            if ($vol.HealthStatus -ne "Healthy" -or ($disk -and $disk.HealthStatus -ne "Healthy")) {
-                Write-Host "?  Recommendation:" -ForegroundColor Yellow
-                if ($vol.OperationalStatus -match "Repair") {
-                    Write-Host "   Run 'chkdsk ${dl}: /f' and back up your data." -ForegroundColor Yellow
-                } elseif ($disk -and $disk.HealthStatus -eq "Warning") {
-                    Write-Host "   Check SMART data and consider replacing the drive." -ForegroundColor Yellow
+                if ($pd) {
+                    $rc = Get-StorageReliabilityCounter -PhysicalDisk $pd -ErrorAction Stop
+                    Write-Host "`nSMART Data:" -ForegroundColor Cyan
+                    Write-Host ("  Power-On Hours   : {0}" -f $rc.PowerOnHours)
+                    Write-Host ("  Temperature (°C) : {0}" -f $rc.Temperature)
                 } else {
-                    Write-Host "   Inspect event logs or use vendor diagnostic tools." -ForegroundColor Yellow
+                    Write-Host "SMART Data         : Not available" -ForegroundColor DarkGray
                 }
-                Write-Host ""
-            }
-        } catch {
-            Write-Host "Error retrieving info for ${dl}: $_" -ForegroundColor Red
+            } catch { Write-Host "SMART Data         : Not available" -ForegroundColor DarkGray }
+            continue
+        }
+
+        # Drive letter target
+        $letter = $t.TrimEnd(':').ToUpper()
+        $ctx = Resolve-ByDriveLetter $letter
+        if (-not $ctx) {
+            Write-Host "Drive ${letter}: not found or not mounted." -ForegroundColor Red
+            continue
+        }
+
+        $vol = $ctx.Volume; $disk = $ctx.Disk
+        Write-Host "`n===============================" -ForegroundColor Cyan
+        Write-Host " Drive ${letter}:" -ForegroundColor Cyan
+        Write-Host "===============================" -ForegroundColor Cyan
+        Write-Host "Health Status     : $($vol.HealthStatus)"
+        Write-Host "Operational Status: $($vol.OperationalStatus)"
+        Write-Host "File System       : $($vol.FileSystemType)"
+        Write-Host "Size / Free       : $([math]::Round($vol.Size/1GB,1)) GB / $([math]::Round($vol.SizeRemaining/1GB,1)) GB"
+        Write-Host "Drive Type        : $($vol.DriveType)"
+        if ($disk) { Write-Host "Disk Model        : $($disk.FriendlyName)" }
+
+        if ($vol.HealthStatus -ne "Healthy") {
+            Write-Host "`nRecommendation:" -ForegroundColor Yellow
+            Write-Host "  Run 'chkdsk ${letter}: /f' and back up your data." -ForegroundColor Yellow
         }
     }
 }
+
 
 # --------------------------
 # wc
